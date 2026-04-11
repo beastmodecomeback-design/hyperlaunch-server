@@ -1,515 +1,308 @@
-/**
- * HYPERLAUNCH BACKEND SERVER
- * - Connects to Solana RPC via Helius
- * - Listens to pump.fun program for new token creation events
- * - Fetches metadata JSON from IPFS instantly on token creation
- * - Caches token data + images in memory
- * - Pushes to all connected frontend clients via WebSocket
- * - Serves cached images as a proxy (no CORS issues)
+/*  HYPERLAUNCH BACKEND SERVER v4
+ *  ─────────────────────────────────────────────────────────────────
+ *  Key feature: image proxy cache
+ *  - Downloads IPFS images server-side the moment token is created
+ *  - Serves them from /img/MINT — browser gets image from Railway CDN
+ *  - No more waiting for IPFS from the browser side
  */
-
-const express = require("express");
-const cors    = require("cors");
-const WebSocket = require("ws");
+ 
 const http    = require("http");
+const WebSocket = require("ws");
 const fetch   = require("node-fetch");
-const { Connection, PublicKey } = require("@solana/web3.js");
-
-// ── Config ────────────────────────────────────────────────
-const PORT         = process.env.PORT || 3001;
-const HELIUS_KEY   = process.env.HELIUS_KEY || "e6c9c34f-ff5b-441d-9ad6-0b32d51223a9";
-const HELIUS_RPC   = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
-const HELIUS_WS    = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
-const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"; // pump.fun program ID
-
-// IPFS gateways to race
-const IPFS_GATEWAYS = [
+ 
+const HELIUS_KEY = process.env.HELIUS_KEY || "e6c9c34f-ff5b-441d-9ad6-0b32d512239a";
+const PORT       = process.env.PORT || 3000;
+const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+ 
+const IPFS_GWS = [
   "https://cf-ipfs.com/ipfs/",
   "https://ipfs.io/ipfs/",
+  "https://nftstorage.link/ipfs/",
   "https://gateway.pinata.cloud/ipfs/",
 ];
-
-// ── In-memory cache ───────────────────────────────────────
-const tokenCache   = new Map(); // mint -> token data
-const imageCache   = new Map(); // url -> buffer
-const MAX_TOKENS   = 500;       // keep last 500 tokens
-
-// ── Express app ───────────────────────────────────────────
-const app    = express();
-const server = http.createServer(app);
-app.use(cors({ origin: "*" }));
-app.use(express.json());
-
-// Health check
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    tokens: tokenCache.size,
-    clients: wss.clients.size,
-    uptime: Math.floor(process.uptime()),
-  });
-});
-
-// Get recent tokens
-app.get("/tokens", (req, res) => {
-  const tokens = [...tokenCache.values()]
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 100);
-  res.json(tokens);
-});
-
-// Image proxy — serves cached images to avoid CORS/IPFS slowness on frontend
-app.get("/img/:mint", async (req, res) => {
-  const { mint } = req.params;
-  const token = tokenCache.get(mint);
-  if (!token || !token.img) {
-    return res.status(404).send("Not found");
-  }
-  // Serve from cache if available
-  if (imageCache.has(mint)) {
-    const buf = imageCache.get(mint);
-    res.setHeader("Content-Type", "image/webp");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    return res.send(buf);
-  }
-  // Proxy the image
+ 
+function resolveIPFS(url) {
+  if (!url) return null;
+  if (url.startsWith("ipfs://")) return IPFS_GWS[0] + url.slice(7).split("?")[0];
+  const m = url.match(/\/ipfs\/([a-zA-Z0-9]{30,})/);
+  if (m) return IPFS_GWS[0] + m[1];
+  return url;
+}
+ 
+function ipfsCID(url) {
+  if (!url) return null;
+  if (url.startsWith("ipfs://")) return url.slice(7).split("?")[0];
+  const m = url.match(/\/ipfs\/([a-zA-Z0-9]{30,})/);
+  return m ? m[1] : null;
+}
+ 
+// ── Caches ───────────────────────────────────────────────────────────────────
+const tokenCache = new Map();  // mint → token
+const imageCache = new Map();  // mint → {data: Buffer, type: string}
+const clients    = new Set();
+ 
+// ── Image downloader — races all gateways ────────────────────────────────────
+async function downloadImage(url, mint) {
+  if (imageCache.has(mint)) return; // already cached
+  if (!url) return;
+ 
+  const cid = ipfsCID(url);
+  const urls = cid
+    ? IPFS_GWS.map(gw => gw + cid)
+    : [url];
+ 
   try {
-    const r = await fetchWithTimeout(token.img, 5000);
-    if (!r.ok) return res.status(404).send("Image fetch failed");
-    const buf = await r.buffer();
-    imageCache.set(mint, buf);
-    res.setHeader("Content-Type", r.headers.get("content-type") || "image/png");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    res.send(buf);
-  } catch (e) {
-    res.status(500).send("Error");
+    const res = await Promise.any(urls.map(u =>
+      fetch(u, { timeout: 8000 })
+        .then(r => { if (!r.ok) throw new Error(r.status); return r; })
+    ));
+    const type = res.headers.get("content-type") || "image/jpeg";
+    const data = await res.buffer();
+    if (data.length > 0) {
+      imageCache.set(mint, { data, type });
+      console.log(`🖼  ${mint.slice(0,8)} cached ${Math.round(data.length/1024)}KB`);
+      // Update token with proxy URL
+      if (tokenCache.has(mint)) {
+        const t = tokenCache.get(mint);
+        t.imgProxy = "/img/" + mint;
+        tokenCache.set(mint, t);
+        broadcast("updateToken", { token: t });
+      }
+    }
+  } catch(e) {
+    // IPFS not ready yet — retry after 3s
+    setTimeout(() => downloadImage(url, mint), 3000);
   }
+}
+ 
+// ── HTTP server ──────────────────────────────────────────────────────────────
+const server = http.createServer((req, res) => {
+  const url = req.url;
+ 
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+ 
+  if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
+ 
+  // Image proxy endpoint — serves cached images instantly
+  if (url.startsWith("/img/")) {
+    const mint = url.slice(5).split("?")[0];
+    if (imageCache.has(mint)) {
+      const { data, type } = imageCache.get(mint);
+      res.writeHead(200, {
+        "Content-Type": type,
+        "Cache-Control": "public, max-age=31536000",
+        "Content-Length": data.length,
+      });
+      res.end(data);
+      return;
+    }
+    res.writeHead(404); res.end("not cached yet");
+    return;
+  }
+ 
+  if (url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      tokens: tokenCache.size,
+      images: imageCache.size,
+      clients: clients.size,
+    }));
+    return;
+  }
+ 
+  res.writeHead(200); res.end("HYPERLAUNCH v4");
 });
-
-// ── WebSocket server (for frontend clients) ───────────────
+ 
+// ── Browser WS ───────────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server });
-
-wss.on("connection", (ws) => {
-  console.log(`Client connected. Total: ${wss.clients.size}`);
-
-  // Send last 50 tokens immediately on connect
-  const recent = [...tokenCache.values()]
-    .sort((a, b) => b.createdAt - a.createdAt)
+wss.on("connection", ws => {
+  clients.add(ws);
+  // Send snapshot of recent tokens
+  const snap = [...tokenCache.values()]
+    .sort((a,b) => (b.createdAt||0)-(a.createdAt||0))
     .slice(0, 50);
-  ws.send(JSON.stringify({ type: "snapshot", tokens: recent }));
-
-  ws.on("close", () => {
-    console.log(`Client disconnected. Total: ${wss.clients.size}`);
-  });
-  ws.on("error", () => {});
+  ws.send(JSON.stringify({ type: "snapshot", tokens: snap }));
+  ws.on("close", () => clients.delete(ws));
+  ws.on("error", () => clients.delete(ws));
 });
-
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
+ 
+function broadcast(type, data) {
+  const msg = JSON.stringify({ type, ...data });
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch(e) {}
     }
-  });
-}
-
-// ── Fetch helpers ─────────────────────────────────────────
-async function fetchWithTimeout(url, ms = 5000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    const r = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    return r;
-  } catch (e) {
-    clearTimeout(timer);
-    throw e;
   }
 }
-
-async function fetchJSON(url, ms = 5000) {
-  try {
-    const r = await fetchWithTimeout(url, ms);
-    if (!r.ok) return null;
-    return await r.json();
-  } catch (e) {
-    return null;
-  }
+ 
+// ── Fetch metadata URI ───────────────────────────────────────────────────────
+async function fetchMeta(uri) {
+  const cid = uri.startsWith("ipfs://") ? uri.slice(7) : null;
+  const urls = cid
+    ? IPFS_GWS.map(gw => gw + cid)
+    : [uri];
+  return Promise.any(urls.map(u =>
+    fetch(u, { timeout: 5000 })
+      .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(m => { if (!m?.image) throw new Error("no image"); return m; })
+  ));
 }
-
-// Race multiple IPFS gateways — return first success
-async function fetchIPFS(hash, ms = 4000) {
-  const urls = IPFS_GATEWAYS.map((g) => g + hash);
-  try {
-    return await Promise.any(
-      urls.map((url) =>
-        fetchJSON(url, ms).then((d) => {
-          if (!d) throw new Error("null");
-          return d;
-        })
-      )
-    );
-  } catch (e) {
-    return null;
+ 
+// ── Handle new token ─────────────────────────────────────────────────────────
+async function handleNewToken(mint, name, symbol, uri, rawImg, twitter, telegram, website) {
+  if (tokenCache.has(mint)) return;
+ 
+  const token = {
+    id: mint, addr: mint, pairAddr: mint,
+    name: symbol.toUpperCase(),
+    sym:  symbol.toUpperCase().slice(0, 6),
+    fullName: name,
+    chain: "SOL", dex: "pump.fun", isPump: true,
+    img:      rawImg ? resolveIPFS(rawImg) : null,
+    imgProxy: null, // set after image download
+    twitter:  twitter  || null,
+    telegram: telegram || null,
+    website:  website  || null,
+    price: 0, c24: 0, vol: 0, mcap: 0,
+    age: 0, bond: 0, buys: 0, sells: 0, holders: 0,
+    url: "https://pump.fun/coin/" + mint,
+    createdAt: Date.now(),
+  };
+ 
+  tokenCache.set(mint, token);
+ 
+  // Broadcast immediately — browser shows logo from rawImg while proxy downloads
+  broadcast("newToken", { token });
+  console.log(`⚡ ${symbol} | ${mint.slice(0,8)} | img=${!!rawImg}`);
+ 
+  // Start downloading image to our proxy cache immediately
+  const imgUrl = rawImg ? resolveIPFS(rawImg) : null;
+  if (imgUrl) {
+    downloadImage(imgUrl, mint); // async, non-blocking
   }
-}
-
-// ── Metadata fetcher ──────────────────────────────────────
-async function fetchTokenMetadata(mint, metaUri) {
-  try {
-    let meta = null;
-
-    // Try metadata URI first (fastest path — direct IPFS JSON)
-    if (metaUri) {
-      const hash = metaUri.startsWith("ipfs://")
-        ? metaUri.slice(7)
-        : metaUri.split("/ipfs/")[1] || null;
-
-      if (hash) {
-        meta = await fetchIPFS(hash.split("?")[0]);
-      } else if (metaUri.startsWith("http")) {
-        meta = await fetchJSON(metaUri, 4000);
+ 
+  // If missing socials/image, fetch metadata URI
+  const needsMeta = !rawImg || (!twitter && !telegram && !website);
+  if (uri && needsMeta) {
+    try {
+      const meta = await fetchMeta(uri);
+      if (meta.image && !token.img) {
+        token.img = resolveIPFS(meta.image);
+        downloadImage(token.img, mint);
       }
-    }
-
-    // Fallback: pump.fun API
-    if (!meta) {
-      meta = await fetchJSON(`https://frontend-api.pump.fun/coins/${mint}`, 4000);
-      if (meta) {
-        // Normalize pump.fun API response to metadata shape
-        return {
-          image:    meta.image_uri || meta.imageUri || null,
-          twitter:  meta.twitter   || null,
-          telegram: meta.telegram  || null,
-          website:  meta.website   || null,
-          name:     meta.name      || null,
-          mcap:     meta.usd_market_cap ? parseFloat(meta.usd_market_cap) : null,
-          holders:  meta.holder_count   ? parseInt(meta.holder_count)     : null,
-        };
-      }
-      return null;
-    }
-
-    // Resolve IPFS image URI to HTTP
-    let imgUrl = meta.image || null;
-    if (imgUrl && imgUrl.startsWith("ipfs://")) {
-      imgUrl = "https://cf-ipfs.com/ipfs/" + imgUrl.slice(7);
-    }
-
-    return {
-      image:    imgUrl,
-      twitter:  meta.twitter  || null,
-      telegram: meta.telegram || null,
-      website:  meta.website  || null,
-      name:     meta.name     || null,
-      mcap:     null,
-      holders:  null,
-    };
-  } catch (e) {
-    return null;
-  }
-}
-
-// ── Prefetch and cache image in background ─────────────────
-async function prefetchImage(mint, imgUrl) {
-  if (!imgUrl || imageCache.has(mint)) return;
-  try {
-    const r = await fetchWithTimeout(imgUrl, 5000);
-    if (r.ok) {
-      const buf = await r.buffer();
-      imageCache.set(mint, buf);
-      console.log(`  📸 Image cached: ${mint.slice(0, 8)}...`);
-    }
-  } catch (e) {}
-}
-
-// ── Token creation handler ────────────────────────────────
-async function handleNewToken(rawData) {
-  try {
-    const mint     = rawData.mint || rawData.tokenAddress || rawData.address || "";
-    const metaUri  = rawData.uri  || rawData.metadataUri  || rawData.metadata_uri || null;
-    const symbol   = (rawData.symbol || "?").toUpperCase();
-    const name     = rawData.name || symbol;
-
-    if (!mint || tokenCache.has(mint)) return;
-
-    console.log(`🆕 New token: ${symbol} (${mint.slice(0, 8)}...)`);
-
-    // Build initial token — emit immediately
-    const token = {
-      id:        mint,
-      mint,
-      name:      symbol,
-      fullName:  name,
-      addr:      mint,
-      chain:     "SOL",
-      dex:       "pump.fun",
-      isPump:    true,
-      price:     parseFloat(rawData.solAmount || 0) / parseFloat(rawData.tokenAmount || 1e9) || 0,
-      mcap:      parseFloat(rawData.marketCapSol || 0) * 170 || 0,
-      vol:       0,
-      liq:       0,
-      bond:      parseFloat(rawData.bondingCurveProgress || 0) || 0,
-      buys:      1,
-      sells:     0,
-      holders:   1,
-      age:       0,
-      img:       null,
-      twitter:   rawData.twitter  || null,
-      telegram:  rawData.telegram || null,
-      website:   rawData.website  || null,
-      url:       `https://pump.fun/coin/${mint}`,
-      createdAt: Date.now(),
-      enriched:  false,
-    };
-
-    // Store + broadcast immediately
-    tokenCache.set(mint, token);
-    broadcast({ type: "newToken", token });
-
-    // Trim cache if too large
-    if (tokenCache.size > MAX_TOKENS) {
-      const oldest = [...tokenCache.entries()]
-        .sort((a, b) => a[1].createdAt - b[1].createdAt)[0];
-      tokenCache.delete(oldest[0]);
-    }
-
-    // Fetch metadata in background — update + re-broadcast when ready
-    const meta = await fetchTokenMetadata(mint, metaUri);
-    if (meta) {
-      if (meta.image)    token.img      = meta.image;
-      if (meta.twitter)  token.twitter  = meta.twitter;
-      if (meta.telegram) token.telegram = meta.telegram;
-      if (meta.website)  token.website  = meta.website;
-      if (meta.name)     token.fullName = meta.name;
-      if (meta.mcap)     token.mcap     = meta.mcap;
-      if (meta.holders)  token.holders  = meta.holders;
-      token.enriched = true;
-
-      // Use our own image proxy URL for the frontend
-      if (token.img) {
-        token.imgProxy = `/img/${mint}`;
-        // Prefetch image in background
-        prefetchImage(mint, token.img);
-      }
-
+      if (meta.twitter  && !token.twitter)  token.twitter  = meta.twitter;
+      if (meta.telegram && !token.telegram) token.telegram = meta.telegram;
+      if (meta.website  && !token.website)  token.website  = meta.website;
       tokenCache.set(mint, token);
-      broadcast({ type: "updateToken", token });
-      console.log(`  ✅ Enriched: ${symbol} img=${!!token.img} tw=${!!token.twitter}`);
-    }
-  } catch (e) {
-    console.error("handleNewToken error:", e.message);
-  }
-}
-
-// ── Helius WebSocket — Solana RPC subscription ────────────
-let heliusWs = null;
-let heliusReconnectTimer = null;
-
-function connectHelius() {
-  console.log("🔌 Connecting to Helius RPC WebSocket...");
-  try {
-    heliusWs = new WebSocket(HELIUS_WS);
-
-    heliusWs.on("open", () => {
-      console.log("✅ Helius WS connected");
-
-      // Subscribe to pump.fun program logs — catches every new token creation
-      heliusWs.send(JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "logsSubscribe",
-        params: [
-          { mentions: [PUMP_PROGRAM] },
-          { commitment: "processed" }
-        ]
-      }));
-    });
-
-    heliusWs.on("message", async (data) => {
-      try {
-        const msg = JSON.parse(data);
-
-        // Subscription confirmed
-        if (msg.result !== undefined && msg.id === 1) {
-          console.log(`✅ Subscribed to pump.fun program logs (sub ${msg.result})`);
-          return;
-        }
-
-        // Log notification
-        if (msg.method === "logsNotification") {
-          const logs = msg.params?.result?.value?.logs || [];
-          const sig  = msg.params?.result?.value?.signature || "";
-
-          // Check if this is a token creation event
-          const isCreate = logs.some(l =>
-            l.includes("InitializeMint") ||
-            l.includes("Create") ||
-            l.includes("create")
-          );
-
-          if (isCreate && sig) {
-            // Fetch transaction details to get token info
-            fetchTokenFromSig(sig);
+      broadcast("updateToken", { token });
+    } catch(e) {
+      // IPFS slow — try pump.fun API
+      setTimeout(async () => {
+        try {
+          const urls = [
+            `https://frontend-api-v3.pump.fun/coins/${mint}`,
+            `https://frontend-api.pump.fun/coins/${mint}`,
+          ];
+          const d = await Promise.any(urls.map(u =>
+            fetch(u, { timeout: 4000, headers: { Accept: "application/json" }})
+              .then(r => { if(!r.ok) throw new Error(r.status); return r.json(); })
+              .then(d => { if(!d.image_uri) throw new Error("no img"); return d; })
+          ));
+          if (d.image_uri && !token.img) {
+            token.img = resolveIPFS(d.image_uri);
+            downloadImage(token.img, mint);
           }
-        }
-      } catch (e) {}
-    });
-
-    heliusWs.on("close", () => {
-      console.log("❌ Helius WS closed, reconnecting in 3s...");
-      heliusReconnectTimer = setTimeout(connectHelius, 3000);
-    });
-
-    heliusWs.on("error", (e) => {
-      console.log("❌ Helius WS error:", e.message);
-    });
-
-    // Ping every 30s to keep connection alive
-    setInterval(() => {
-      if (heliusWs.readyState === WebSocket.OPEN) {
-        heliusWs.send(JSON.stringify({ jsonrpc: "2.0", id: 99, method: "ping" }));
-      }
-    }, 30000);
-
-  } catch (e) {
-    console.error("Helius connect error:", e.message);
-    heliusReconnectTimer = setTimeout(connectHelius, 5000);
+          if (d.twitter  && !token.twitter)  token.twitter  = d.twitter;
+          if (d.telegram && !token.telegram) token.telegram = d.telegram;
+          if (d.website  && !token.website)  token.website  = d.website;
+          tokenCache.set(mint, token);
+          broadcast("updateToken", { token });
+        } catch(e2) {}
+      }, 2000);
+    }
   }
 }
-
-// Fetch transaction to extract token creation data
-async function fetchTokenFromSig(sig) {
-  try {
-    const data = await fetchJSON(
-      `https://api.helius.xyz/v0/transactions/?api-key=${HELIUS_KEY}`,
-      // POST request
-      null
-    );
-    // Use Helius enhanced transaction API
-    const r = await fetchWithTimeout(
-      `https://api.helius.xyz/v0/transactions?api-key=${HELIUS_KEY}`,
-      8000
-    );
-  } catch (e) {}
-}
-
-// ── pumpportal WebSocket (secondary feed) ─────────────────
-let ppWs = null;
-let ppReconnect = null;
-
-function connectPumpPortal() {
-  console.log("🔌 Connecting to pumpportal.fun WebSocket...");
-  try {
-    ppWs = new WebSocket("wss://pumpportal.fun/api/data");
-
-    ppWs.on("open", () => {
-      console.log("✅ pumpportal.fun connected");
-      ppWs.send(JSON.stringify({ method: "subscribeNewToken" }));
-    });
-
-    ppWs.on("message", async (data) => {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.txType === "create" || msg.event === "NewToken") {
-          await handleNewToken(msg);
-        }
-      } catch (e) {}
-    });
-
-    ppWs.on("close", () => {
-      console.log("❌ pumpportal WS closed, reconnecting in 3s...");
-      ppReconnect = setTimeout(connectPumpPortal, 3000);
-    });
-
-    ppWs.on("error", () => {});
-  } catch (e) {
-    ppReconnect = setTimeout(connectPumpPortal, 5000);
-  }
-}
-
-// ── pump.fun frontend WebSocket (tertiary feed) ───────────
-let pfWs = null;
-let pfReconnect = null;
-
+ 
+// ── SOURCE: pump.fun Socket.IO ───────────────────────────────────────────────
 function connectPumpFun() {
-  console.log("🔌 Connecting to pump.fun frontend WebSocket...");
-  try {
-    pfWs = new WebSocket("wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket");
-
-    pfWs.on("open", () => {
-      pfWs.send("40");
-      setTimeout(() => {
-        try { pfWs.send('42["joinRoom","global"]'); } catch (e) {}
-      }, 500);
-    });
-
-    pfWs.on("message", async (data) => {
-      try {
-        const raw = data.toString();
-        if (raw === "2") return pfWs.send("3"); // pong
-        if (!raw.startsWith("42")) return;
-        const arr = JSON.parse(raw.slice(2));
-        if (!arr || !arr[0]) return;
-        const evt = arr[0], msg = arr[1] || {};
-        if (evt === "newCoinCreated" || evt === "create" || evt === "tokenCreated") {
-          await handleNewToken(msg);
-        }
-      } catch (e) {}
-    });
-
-    pfWs.on("close", () => {
-      pfReconnect = setTimeout(connectPumpFun, 3000);
-    });
-
-    pfWs.on("error", () => {});
-  } catch (e) {
-    pfReconnect = setTimeout(connectPumpFun, 5000);
-  }
-}
-
-// ── Periodic pump.fun API poll (catch any missed tokens) ──
-async function pollPumpFun() {
-  try {
-    const url = "https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC&includeNsfw=false";
-    const data = await fetchJSON(url, 5000);
-    const coins = Array.isArray(data) ? data : (data?.coins || []);
-    for (const c of coins) {
-      if (!tokenCache.has(c.mint)) {
-        await handleNewToken({
-          mint:        c.mint,
-          symbol:      c.symbol,
-          name:        c.name,
-          uri:         c.metadata_uri || null,
-          image_uri:   c.image_uri    || null,
-          twitter:     c.twitter      || null,
-          telegram:    c.telegram     || null,
-          website:     c.website      || null,
-          marketCapSol: c.market_cap  || 0,
-          bondingCurveProgress: c.bonding_curve_progress || 0,
+  const ws = new WebSocket("wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket");
+  ws.on("open", () => {
+    ws.send("40");
+    setTimeout(() => { try { ws.send('42["joinRoom","global"]'); } catch(e) {} }, 300);
+    console.log("✅ pump.fun WS connected");
+  });
+  ws.on("message", async data => {
+    try {
+      const raw = data.toString();
+      if (raw === "2") { ws.send("3"); return; }
+      if (!raw.startsWith("42")) return;
+      const arr = JSON.parse(raw.slice(2));
+      if (!arr?.[0]) return;
+      const evt = arr[0], msg = arr[1];
+ 
+      if (evt === "newCoinCreated" || evt === "tokenCreated") {
+        const mint = msg?.mint || "";
+        if (!mint) return;
+        // pump.fun WS sends image_uri + socials directly
+        await handleNewToken(
+          mint,
+          msg.name     || msg.symbol || "?",
+          msg.symbol   || "?",
+          msg.metadata_uri || msg.uri || "",
+          msg.image_uri || msg.imageUri || null,
+          msg.twitter  || null,
+          msg.telegram || null,
+          msg.website  || null,
+        );
+      }
+ 
+      if (evt === "tradeCreated" || evt === "trade") {
+        const mint = msg?.mint || "";
+        if (!mint || !tokenCache.has(mint)) return;
+        const t = tokenCache.get(mint);
+        const sol = parseFloat(msg.sol_amount || msg.solAmount || 0);
+        const isBuy = msg.is_buy === true || msg.txType === "buy";
+        t.vol  = (t.vol  || 0) + sol * 170;
+        t.mcap = parseFloat(msg.market_cap_sol || 0) * 170 || t.mcap;
+        if (isBuy) t.buys  = (t.buys  || 0) + 1;
+        else       t.sells = (t.sells || 0) + 1;
+        tokenCache.set(mint, t);
+        broadcast("updateToken", {
+          token: { mint, addr: mint, id: mint,
+            _trade: { type: isBuy?"buy":"sell", usd: sol*170, mcapSol: parseFloat(msg.market_cap_sol||0) }
+          }
         });
       }
-    }
-  } catch (e) {}
+    } catch(e) {}
+  });
+  ws.on("close", () => setTimeout(connectPumpFun, 2000));
+  ws.on("error", () => setTimeout(connectPumpFun, 3000));
 }
-
-// ── Start everything ──────────────────────────────────────
+ 
+// ── Cache trim ───────────────────────────────────────────────────────────────
+setInterval(() => {
+  if (tokenCache.size > 500) {
+    const keep = [...tokenCache.entries()]
+      .sort((a,b) => (b[1].createdAt||0)-(a[1].createdAt||0))
+      .slice(0, 400);
+    tokenCache.clear();
+    keep.forEach(([k,v]) => tokenCache.set(k,v));
+  }
+  // Keep image cache under 200MB
+  if (imageCache.size > 600) {
+    const keys = [...imageCache.keys()].slice(0, 200);
+    keys.forEach(k => imageCache.delete(k));
+  }
+}, 60000);
+ 
+// ── Boot ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════╗
-║   HYPERLAUNCH SERVER                 ║
-║   Port: ${PORT}                          ║
-║   Starting feeds...                  ║
-╚══════════════════════════════════════╝
-  `);
-
-  // Connect all three feeds
-  connectPumpPortal();
+  console.log(`\n🚀 HYPERLAUNCH SERVER v4`);
+  console.log(`   Port:   ${PORT}`);
+  console.log(`   Images: cached at /img/MINT — instant for browser`);
   connectPumpFun();
-
-  // Poll pump.fun API every 10s as safety net
-  setInterval(pollPumpFun, 10000);
-  pollPumpFun(); // immediate first poll
-
-  console.log("🚀 Server ready!");
 });
+ 
