@@ -1,24 +1,15 @@
-/*  HYPERLAUNCH BACKEND SERVER v4
- *  ─────────────────────────────────────────────────────────────────
- *  Key feature: image proxy cache
- *  - Downloads IPFS images server-side the moment token is created
- *  - Serves them from /img/MINT — browser gets image from Railway CDN
- *  - No more waiting for IPFS from the browser side
- */
-
-const http    = require("http");
+const http = require("http");
 const WebSocket = require("ws");
-const fetch   = require("node-fetch");
+const fetch = require("node-fetch");
 
+const PORT = process.env.PORT || 3000;
 const HELIUS_KEY = process.env.HELIUS_KEY || "e6c9c34f-ff5b-441d-9ad6-0b32d512239a";
-const PORT       = process.env.PORT || 3000;
 const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
 const IPFS_GWS = [
   "https://cf-ipfs.com/ipfs/",
   "https://ipfs.io/ipfs/",
   "https://nftstorage.link/ipfs/",
-  "https://gateway.pinata.cloud/ipfs/",
 ];
 
 function resolveIPFS(url) {
@@ -29,71 +20,26 @@ function resolveIPFS(url) {
   return url;
 }
 
-function ipfsCID(url) {
-  if (!url) return null;
-  if (url.startsWith("ipfs://")) return url.slice(7).split("?")[0];
-  const m = url.match(/\/ipfs\/([a-zA-Z0-9]{30,})/);
-  return m ? m[1] : null;
-}
-
 const tokenCache = new Map();
-const imageCache = new Map();
-const clients    = new Set();
-
-async function downloadImage(url, mint) {
-  if (imageCache.has(mint)) return;
-  if (!url) return;
-  const cid = ipfsCID(url);
-  const urls = cid ? IPFS_GWS.map(gw => gw + cid) : [url];
-  try {
-    const res = await Promise.any(urls.map(u =>
-      fetch(u, { timeout: 8000 }).then(r => { if (!r.ok) throw new Error(r.status); return r; })
-    ));
-    const type = res.headers.get("content-type") || "image/jpeg";
-    const data = await res.buffer();
-    if (data.length > 0) {
-      imageCache.set(mint, { data, type });
-      console.log(`🖼  ${mint.slice(0,8)} cached ${Math.round(data.length/1024)}KB`);
-      if (tokenCache.has(mint)) {
-        const t = tokenCache.get(mint);
-        t.imgProxy = "/img/" + mint;
-        tokenCache.set(mint, t);
-        broadcast("updateToken", { token: t });
-      }
-    }
-  } catch(e) {
-    setTimeout(() => downloadImage(url, mint), 3000);
-  }
-}
+const clients = new Set();
 
 const server = http.createServer((req, res) => {
-  const url = req.url;
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
-  if (url.startsWith("/img/")) {
-    const mint = url.slice(5).split("?")[0];
-    if (imageCache.has(mint)) {
-      const { data, type } = imageCache.get(mint);
-      res.writeHead(200, { "Content-Type": type, "Cache-Control": "public, max-age=31536000", "Content-Length": data.length });
-      res.end(data);
-      return;
-    }
-    res.writeHead(404); res.end("not cached yet");
-    return;
-  }
-  if (url === "/health") {
+  if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, tokens: tokenCache.size, images: imageCache.size, clients: clients.size }));
+    res.end(JSON.stringify({ ok: true, tokens: tokenCache.size, clients: clients.size }));
     return;
   }
-  res.writeHead(200); res.end("HYPERLAUNCH v4");
+  res.writeHead(200);
+  res.end("HYPERLAUNCH OK");
 });
 
 const wss = new WebSocket.Server({ server });
 wss.on("connection", ws => {
   clients.add(ws);
-  const snap = [...tokenCache.values()].sort((a,b) => (b.createdAt||0)-(a.createdAt||0)).slice(0, 50);
+  const snap = [...tokenCache.values()]
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, 50);
   ws.send(JSON.stringify({ type: "snapshot", tokens: snap }));
   ws.on("close", () => clients.delete(ws));
   ws.on("error", () => clients.delete(ws));
@@ -102,69 +48,105 @@ wss.on("connection", ws => {
 function broadcast(type, data) {
   const msg = JSON.stringify({ type, ...data });
   for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) { try { ws.send(msg); } catch(e) {} }
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(msg); } catch (e) {}
+    }
   }
 }
 
-async function fetchMeta(uri) {
-  const cid = uri.startsWith("ipfs://") ? uri.slice(7) : null;
-  const urls = cid ? IPFS_GWS.map(gw => gw + cid) : [uri];
-  return Promise.any(urls.map(u =>
-    fetch(u, { timeout: 5000 }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }).then(m => { if (!m?.image) throw new Error("no image"); return m; })
-  ));
-}
-
-async function handleNewToken(mint, name, symbol, uri, rawImg, twitter, telegram, website) {
+function handleNewToken(mint, name, symbol, rawImg, twitter, telegram, website, mcap, bond) {
   if (tokenCache.has(mint)) return;
   const token = {
     id: mint, addr: mint, pairAddr: mint,
-    name: symbol.toUpperCase(), sym: symbol.toUpperCase().slice(0, 6), fullName: name,
+    name: (symbol || "?").toUpperCase(),
+    sym: (symbol || "?").toUpperCase().slice(0, 6),
+    fullName: name || symbol || "",
     chain: "SOL", dex: "pump.fun", isPump: true,
-    img: rawImg ? resolveIPFS(rawImg) : null, imgProxy: null,
-    twitter: twitter || null, telegram: telegram || null, website: website || null,
-    price: 0, c24: 0, vol: 0, mcap: 0, age: 0, bond: 0, buys: 0, sells: 0, holders: 0,
-    url: "https://pump.fun/coin/" + mint, createdAt: Date.now(),
+    img: rawImg ? resolveIPFS(rawImg) : null,
+    twitter: twitter || null,
+    telegram: telegram || null,
+    website: website || null,
+    price: 0, c24: 0, vol: 0,
+    mcap: parseFloat(mcap || 0) || 0,
+    fdv: parseFloat(mcap || 0) || 0,
+    age: 0, bond: parseFloat(bond || 0) || 0,
+    buys: 0, sells: 0, holders: 0,
+    url: "https://pump.fun/coin/" + mint,
+    createdAt: Date.now(),
   };
   tokenCache.set(mint, token);
   broadcast("newToken", { token });
-  console.log(`⚡ ${symbol} | ${mint.slice(0,8)} | img=${!!rawImg}`);
-  const imgUrl = rawImg ? resolveIPFS(rawImg) : null;
-  if (imgUrl) downloadImage(imgUrl, mint);
-  const needsMeta = !rawImg || (!twitter && !telegram && !website);
-  if (uri && needsMeta) {
+  console.log(`⚡ ${token.sym} | ${mint.slice(0, 8)} | img=${!!rawImg}`);
+}
+
+function connectHelius() {
+  console.log("Connecting Helius Enhanced WS...");
+  const ws = new WebSocket(`wss://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`);
+  let pingInterval;
+  ws.on("open", () => {
+    console.log("✅ Helius Enhanced WS connected");
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0", id: 1,
+      method: "transactionSubscribe",
+      params: [
+        { accountInclude: [PUMP_PROGRAM], failed: false },
+        { commitment: "confirmed", encoding: "jsonParsed", transactionDetails: "full", maxSupportedTransactionVersion: 0 }
+      ]
+    }));
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: "ping", method: "ping" }));
+      }
+    }, 15000);
+  });
+  ws.on("message", async data => {
     try {
-      const meta = await fetchMeta(uri);
-      if (meta.image && !token.img) { token.img = resolveIPFS(meta.image); downloadImage(token.img, mint); }
-      if (meta.twitter  && !token.twitter)  token.twitter  = meta.twitter;
-      if (meta.telegram && !token.telegram) token.telegram = meta.telegram;
-      if (meta.website  && !token.website)  token.website  = meta.website;
-      tokenCache.set(mint, token);
-      broadcast("updateToken", { token });
-    } catch(e) {
-      setTimeout(async () => {
-        try {
-          const urls = [`https://frontend-api-v3.pump.fun/coins/${mint}`, `https://frontend-api.pump.fun/coins/${mint}`];
-          const d = await Promise.any(urls.map(u =>
-            fetch(u, { timeout: 4000, headers: { Accept: "application/json" }}).then(r => { if(!r.ok) throw new Error(r.status); return r.json(); }).then(d => { if(!d.image_uri) throw new Error("no img"); return d; })
-          ));
-          if (d.image_uri && !token.img) { token.img = resolveIPFS(d.image_uri); downloadImage(token.img, mint); }
-          if (d.twitter  && !token.twitter)  token.twitter  = d.twitter;
-          if (d.telegram && !token.telegram) token.telegram = d.telegram;
-          if (d.website  && !token.website)  token.website  = d.website;
-          tokenCache.set(mint, token);
-          broadcast("updateToken", { token });
-        } catch(e2) {}
-      }, 2000);
-    }
-  }
+      const msg = JSON.parse(data.toString());
+      const result = msg?.params?.result;
+      if (!result) return;
+      const logs = result?.transaction?.meta?.logMessages || [];
+      const isCreate = logs.some(l => l.includes("InitializeMint2") || l.includes("Instruction: Create"));
+      if (!isCreate) {
+        const mint = result?.transaction?.meta?.postTokenBalances?.[0]?.mint;
+        if (mint && tokenCache.has(mint)) {
+          const t = tokenCache.get(mint);
+          const isBuy = logs.some(l => l.includes("Instruction: Buy"));
+          const preB = result?.transaction?.meta?.preBalances?.[0] || 0;
+          const postB = result?.transaction?.meta?.postBalances?.[0] || 0;
+          const sol = Math.abs(postB - preB) / 1e9;
+          t.vol = (t.vol || 0) + sol * 170;
+          if (isBuy) t.buys = (t.buys || 0) + 1;
+          else t.sells = (t.sells || 0) + 1;
+          tokenCache.set(mint, t);
+          broadcast("updateToken", { token: { mint, addr: mint, id: mint, _trade: { type: isBuy ? "buy" : "sell", usd: sol * 170, mcapSol: 0 } } });
+        }
+        return;
+      }
+      const keys = result?.transaction?.transaction?.message?.accountKeys || [];
+      const mint = keys[1]?.pubkey || keys[1];
+      if (!mint || tokenCache.has(mint)) return;
+      console.log(`⚡ Helius: new token ${mint.slice(0,8)}`);
+      try {
+        const urls = [`https://frontend-api-v3.pump.fun/coins/${mint}`, `https://frontend-api.pump.fun/coins/${mint}`];
+        const d = await Promise.any(urls.map(u =>
+          fetch(u, { timeout: 4000, headers: { Accept: "application/json" } }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+        ));
+        handleNewToken(mint, d.name, d.symbol, d.image_uri, d.twitter, d.telegram, d.website, d.usd_market_cap, d.bonding_curve_progress);
+      } catch(e) {
+        handleNewToken(mint, "?", "?", null, null, null, null, 0, 0);
+      }
+    } catch (e) {}
+  });
+  ws.on("close", () => { clearInterval(pingInterval); setTimeout(connectHelius, 2000); });
+  ws.on("error", e => { clearInterval(pingInterval); setTimeout(connectHelius, 3000); });
 }
 
 function connectPumpFun() {
   const ws = new WebSocket("wss://frontend-api.pump.fun/socket.io/?EIO=4&transport=websocket");
   ws.on("open", () => {
     ws.send("40");
-    setTimeout(() => { try { ws.send('42["joinRoom","global"]'); } catch(e) {} }, 300);
-    console.log("✅ pump.fun WS connected");
+    setTimeout(() => { try { ws.send('42["joinRoom","global"]'); } catch (e) {} }, 300);
+    console.log("✅ pump.fun WS connected (backup)");
   });
   ws.on("message", async data => {
     try {
@@ -176,8 +158,8 @@ function connectPumpFun() {
       const evt = arr[0], msg = arr[1];
       if (evt === "newCoinCreated" || evt === "tokenCreated") {
         const mint = msg?.mint || "";
-        if (!mint) return;
-        await handleNewToken(mint, msg.name || msg.symbol || "?", msg.symbol || "?", msg.metadata_uri || msg.uri || "", msg.image_uri || msg.imageUri || null, msg.twitter || null, msg.telegram || null, msg.website || null);
+        if (!mint || tokenCache.has(mint)) return;
+        handleNewToken(mint, msg.name, msg.symbol, msg.image_uri || msg.imageUri, msg.twitter, msg.telegram, msg.website, msg.usd_market_cap, msg.bonding_curve_progress);
       }
       if (evt === "tradeCreated" || evt === "trade") {
         const mint = msg?.mint || "";
@@ -185,14 +167,14 @@ function connectPumpFun() {
         const t = tokenCache.get(mint);
         const sol = parseFloat(msg.sol_amount || msg.solAmount || 0);
         const isBuy = msg.is_buy === true || msg.txType === "buy";
-        t.vol  = (t.vol  || 0) + sol * 170;
+        t.vol = (t.vol || 0) + sol * 170;
         t.mcap = parseFloat(msg.market_cap_sol || 0) * 170 || t.mcap;
         if (isBuy) t.buys = (t.buys || 0) + 1;
-        else       t.sells = (t.sells || 0) + 1;
+        else t.sells = (t.sells || 0) + 1;
         tokenCache.set(mint, t);
-        broadcast("updateToken", { token: { mint, addr: mint, id: mint, _trade: { type: isBuy?"buy":"sell", usd: sol*170, mcapSol: parseFloat(msg.market_cap_sol||0) } } });
+        broadcast("updateToken", { token: { mint, addr: mint, id: mint, _trade: { type: isBuy ? "buy" : "sell", usd: sol * 170, mcapSol: parseFloat(msg.market_cap_sol || 0) } } });
       }
-    } catch(e) {}
+    } catch (e) {}
   });
   ws.on("close", () => setTimeout(connectPumpFun, 2000));
   ws.on("error", () => setTimeout(connectPumpFun, 3000));
@@ -200,19 +182,16 @@ function connectPumpFun() {
 
 setInterval(() => {
   if (tokenCache.size > 500) {
-    const keep = [...tokenCache.entries()].sort((a,b) => (b[1].createdAt||0)-(a[1].createdAt||0)).slice(0, 400);
+    const keep = [...tokenCache.entries()].sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0)).slice(0, 400);
     tokenCache.clear();
-    keep.forEach(([k,v]) => tokenCache.set(k,v));
-  }
-  if (imageCache.size > 600) {
-    const keys = [...imageCache.keys()].slice(0, 200);
-    keys.forEach(k => imageCache.delete(k));
+    keep.forEach(([k, v]) => tokenCache.set(k, v));
   }
 }, 60000);
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 HYPERLAUNCH SERVER v4`);
+  console.log(`\n🚀 HYPERLAUNCH SERVER v5`);
   console.log(`   Port:   ${PORT}`);
-  console.log(`   Images: cached at /img/MINT — instant for browser`);
+  console.log(`   Helius: ${HELIUS_KEY.slice(0,8)}...`);
+  connectHelius();
   connectPumpFun();
 });
