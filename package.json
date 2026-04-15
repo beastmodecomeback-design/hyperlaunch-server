@@ -1,8 +1,12 @@
 {
-  "name": "hyperlaunch-server",
-  "version": "4.0.0",
+  "name": "hyperlaunch-sync",
+  "version": "1.0.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "node-fetch": "2.6.9", "ws": "^8.16.0" },
-  "engines": { "node": ">=18.0.0" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "@supabase/supabase-js": "^2.39.0"
+  }
 }
